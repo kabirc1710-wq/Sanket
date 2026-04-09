@@ -33,43 +33,43 @@ const SECTOR_COLORS = {
   "Conglomerate":"#8b5cf6"
 };
 
-// ─── Twelve Data API ──────────────────────────────────────────────────────────
-const TD_KEY = process.env.REACT_APP_TWELVE_DATA_KEY || "2304e41544a0431a80ca122e8f216afd";
-const TD_BASE = "https://api.twelvedata.com";
+// ─── Twelve Data API — All calls go through /api/market (key is server-side) ──
+// ⚠️  The API key is NEVER in this file. It lives in your Vercel env variables
+//     as TWELVE_DATA_API_KEY (no REACT_APP_ prefix = not exposed to browser).
 const dataCache = {};
 
 // Check if Indian market is currently open (IST 9:15am–3:30pm, Mon–Fri)
 function isMarketOpen() {
   const now = new Date();
   const ist = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-  const day = ist.getDay(); // 0=Sun, 6=Sat
+  const day = ist.getDay();
   if (day === 0 || day === 6) return false;
   const h = ist.getHours(), m = ist.getMinutes();
   const mins = h * 60 + m;
   return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
 }
 
-// Fetch current price for one symbol
+// Fetch current price for one symbol (via secure backend proxy)
 async function fetchTDPrice(symbol) {
   try {
-    const res = await fetch(`${TD_BASE}/price?symbol=${symbol}:NSE&apikey=${TD_KEY}`);
+    const res = await fetch(`/api/market?type=price&symbol=${symbol}`);
     const data = await res.json();
-    if (data.status === "error" || !data.price) throw new Error(data.message || "No price");
+    if (data.error || !data.price) throw new Error(data.error || "No price");
     return parseFloat(data.price);
   } catch {
     return null;
   }
 }
 
-// Fetch full quote (price + 52w high/low etc)
+// Fetch full quote — price, 52w high/low, change%, etc (via secure backend proxy)
 async function fetchTDQuote(symbol) {
   if (dataCache[symbol]?.quote && Date.now() - dataCache[symbol].quoteFetched < 60000) {
     return dataCache[symbol].quote;
   }
   try {
-    const res = await fetch(`${TD_BASE}/quote?symbol=${symbol}:NSE&apikey=${TD_KEY}`);
+    const res = await fetch(`/api/market?type=quote&symbol=${symbol}`);
     const data = await res.json();
-    if (data.status === "error" || !data.close) throw new Error("No quote");
+    if (data.error || !data.close) throw new Error(data.error || "No quote");
     const quote = {
       price: parseFloat(data.close),
       open: parseFloat(data.open),
@@ -91,13 +91,13 @@ async function fetchTDQuote(symbol) {
   }
 }
 
-// Fetch historical daily candles (up to 1 year)
+// Fetch historical daily candles up to 1 year (via secure backend proxy)
 async function fetchTDHistory(symbol) {
   if (dataCache[symbol]?.history) return dataCache[symbol].history;
   try {
-    const res = await fetch(`${TD_BASE}/time_series?symbol=${symbol}:NSE&interval=1day&outputsize=365&apikey=${TD_KEY}`);
+    const res = await fetch(`/api/market?type=history&symbol=${symbol}`);
     const data = await res.json();
-    if (data.status === "error" || !data.values) throw new Error(data.message || "No history");
+    if (data.error || !data.values) throw new Error(data.error || "No history");
     // Twelve Data returns newest first — reverse it
     const history = data.values.reverse().map(d => ({
       ts: new Date(d.datetime).getTime(),
@@ -116,15 +116,13 @@ async function fetchTDHistory(symbol) {
   }
 }
 
-// Refresh live prices for all stocks in portfolio (call every 60s during market hours)
+// Refresh live prices for all portfolio stocks — batched (via secure backend proxy)
 async function refreshLivePrices(portfolio) {
   const results = {};
-  // Batch up to 8 symbols in one call (Twelve Data supports comma-separated)
-  const symbols = portfolio.map(s => `${s.symbol}:NSE`).join(",");
+  const symbolList = portfolio.map(s => s.symbol).join(",");
   try {
-    const res = await fetch(`${TD_BASE}/price?symbol=${symbols}&apikey=${TD_KEY}`);
+    const res = await fetch(`/api/market?type=prices&symbols=${symbolList}`);
     const data = await res.json();
-    // If single stock, data is { price: "xxx" }, if multiple it's { SYMBOL:NSE: { price: "xxx" } }
     if (portfolio.length === 1) {
       if (data.price) results[portfolio[0].symbol] = parseFloat(data.price);
     } else {
