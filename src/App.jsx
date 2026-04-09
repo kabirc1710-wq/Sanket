@@ -33,12 +33,11 @@ const SECTOR_COLORS = {
   "Conglomerate":"#8b5cf6"
 };
 
-// ─── Twelve Data API — All calls go through /api/market (key is server-side) ──
-// ⚠️  The API key is NEVER in this file. It lives in your Vercel env variables
-//     as TWELVE_DATA_API_KEY (no REACT_APP_ prefix = not exposed to browser).
+// ─── Yahoo Finance API (free, no key needed) ──────────────────────────────────
+// Uses allorigins.win as a CORS proxy to call Yahoo Finance
 const dataCache = {};
+const PROXY = "https://api.allorigins.win/raw?url=";
 
-// Check if Indian market is currently open (IST 9:15am–3:30pm, Mon–Fri)
 function isMarketOpen() {
   const now = new Date();
   const ist = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
@@ -49,38 +48,27 @@ function isMarketOpen() {
   return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
 }
 
-// Fetch current price for one symbol (via secure backend proxy)
-async function fetchTDPrice(symbol) {
-  try {
-    const res = await fetch(`/api/market?type=price&symbol=${symbol}`);
-    const data = await res.json();
-    if (data.error || !data.price) throw new Error(data.error || "No price");
-    return parseFloat(data.price);
-  } catch {
-    return null;
-  }
-}
-
-// Fetch full quote — price, 52w high/low, change%, etc (via secure backend proxy)
-async function fetchTDQuote(symbol) {
+async function fetchYahooQuote(symbol) {
   if (dataCache[symbol]?.quote && Date.now() - dataCache[symbol].quoteFetched < 60000) {
     return dataCache[symbol].quote;
   }
   try {
-    const res = await fetch(`/api/market?type=quote&symbol=${symbol}`);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1d`;
+    const res = await fetch(PROXY + encodeURIComponent(url));
     const data = await res.json();
-    if (data.error || !data.close) throw new Error(data.error || "No quote");
+    const meta = data?.chart?.result?.[0]?.meta;
+    if (!meta) throw new Error("No data");
     const quote = {
-      price: parseFloat(data.close),
-      open: parseFloat(data.open),
-      high: parseFloat(data.high),
-      low: parseFloat(data.low),
-      prevClose: parseFloat(data.previous_close),
-      volume: parseInt(data.volume),
-      fiftyTwoWeekHigh: parseFloat(data["52_week"]["high"]),
-      fiftyTwoWeekLow: parseFloat(data["52_week"]["low"]),
-      change: parseFloat(data.change),
-      changePct: parseFloat(data.percent_change),
+      price: meta.regularMarketPrice || meta.previousClose,
+      prevClose: meta.previousClose,
+      open: meta.regularMarketOpen,
+      high: meta.regularMarketDayHigh,
+      low: meta.regularMarketDayLow,
+      volume: meta.regularMarketVolume,
+      fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh,
+      fiftyTwoWeekLow: meta.fiftyTwoWeekLow,
+      change: meta.regularMarketPrice - meta.previousClose,
+      changePct: ((meta.regularMarketPrice - meta.previousClose) / meta.previousClose * 100),
     };
     if (!dataCache[symbol]) dataCache[symbol] = {};
     dataCache[symbol].quote = quote;
@@ -91,22 +79,25 @@ async function fetchTDQuote(symbol) {
   }
 }
 
-// Fetch historical daily candles up to 1 year (via secure backend proxy)
-async function fetchTDHistory(symbol) {
+async function fetchYahooHistory(symbol) {
   if (dataCache[symbol]?.history) return dataCache[symbol].history;
   try {
-    const res = await fetch(`/api/market?type=history&symbol=${symbol}`);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1y`;
+    const res = await fetch(PROXY + encodeURIComponent(url));
     const data = await res.json();
-    if (data.error || !data.values) throw new Error(data.error || "No history");
-    // Twelve Data returns newest first — reverse it
-    const history = data.values.reverse().map(d => ({
-      ts: new Date(d.datetime).getTime(),
-      date: new Date(d.datetime),
-      close: parseFloat(d.close),
-      high: parseFloat(d.high),
-      low: parseFloat(d.low),
-      open: parseFloat(d.open),
-      volume: parseInt(d.volume) || 0,
+    const result = data?.chart?.result?.[0];
+    if (!result) throw new Error("No data");
+    const timestamps = result.timestamp;
+    const quotes = result.indicators?.quote?.[0];
+    if (!timestamps || !quotes) throw new Error("No quotes");
+    const history = timestamps.map((ts, i) => ({
+      ts: ts * 1000,
+      date: new Date(ts * 1000),
+      close: quotes.close[i] || 0,
+      high: quotes.high[i] || 0,
+      low: quotes.low[i] || 0,
+      open: quotes.open[i] || 0,
+      volume: quotes.volume[i] || 0,
     })).filter(d => d.close > 0);
     if (!dataCache[symbol]) dataCache[symbol] = {};
     dataCache[symbol].history = history;
@@ -116,26 +107,16 @@ async function fetchTDHistory(symbol) {
   }
 }
 
-// Refresh live prices for all portfolio stocks — batched (via secure backend proxy)
 async function refreshLivePrices(portfolio) {
   const results = {};
-  const symbolList = portfolio.map(s => s.symbol).join(",");
-  try {
-    const res = await fetch(`/api/market?type=prices&symbols=${symbolList}`);
-    const data = await res.json();
-    if (portfolio.length === 1) {
-      if (data.price) results[portfolio[0].symbol] = parseFloat(data.price);
-    } else {
-      for (const stock of portfolio) {
-        const key = `${stock.symbol}:NSE`;
-        if (data[key]?.price) results[stock.symbol] = parseFloat(data[key].price);
-      }
-    }
-  } catch {}
+  await Promise.all(portfolio.map(async s => {
+    const quote = await fetchYahooQuote(s.symbol);
+    if (quote?.price) results[s.symbol] = quote.price;
+  }));
   return results;
 }
 
-// Fallback: generate realistic simulated history if API fails
+// Fallback simulated history if API fails
 function generateHistory(basePrice, days = 252) {
   const h = [];
   let p = basePrice * 0.75;
@@ -333,13 +314,11 @@ function getBuySellReasons(ind, stock) {
   return { buyReasons: buyReasons.slice(0, 4), avoidReasons: avoidReasons.slice(0, 4) };
 }
 
-// ─── Signal Helpers ───────────────────────────────────────────────────────────
 function sig(score) { return score >= 7 ? "BUY" : score <= 3.5 ? "SELL" : "HOLD"; }
 function sigColor(s) { return s === "BUY" ? "#16a34a" : s === "SELL" ? "#dc2626" : "#d97706"; }
 function sigBg(s) { return s === "BUY" ? "#f0fdf4" : s === "SELL" ? "#fef2f2" : "#fffbeb"; }
 function sigBorder(s) { return s === "BUY" ? "#bbf7d0" : s === "SELL" ? "#fecaca" : "#fde68a"; }
 
-// ─── Beginner-Friendly Plain English Descriptions ─────────────────────────────
 const PLAIN_ENGLISH = {
   "Supertrend": "🌊 Like a wave detector — it tells you if the stock is riding an upwave (BUY) or a downwave (SELL). Super simple and reliable.",
   "MACD": "🏃 Two runners racing. MACD shows if the fast runner is pulling ahead (bullish) or falling behind (bearish) the slow runner.",
@@ -372,7 +351,6 @@ const EXPLANATIONS = {
   "VWAP": { what: "Volume Weighted Average Price. The average price weighted by trading volume — used by institutions as a benchmark.", howToRead: "Price above VWAP = bullish momentum. Price below = bearish bias.", emoji: "⚖️" },
 };
 
-// ─── URL Generators ───────────────────────────────────────────────────────────
 function getResearchLinks(symbol) {
   const s = symbol.toUpperCase();
   return {
@@ -397,7 +375,6 @@ function getResearchLinks(symbol) {
   };
 }
 
-// ─── Components ───────────────────────────────────────────────────────────────
 const ScoreRing = memo(function ScoreRing({ score, size = 68 }) {
   const r = size * 0.38, cx = size / 2, cy = size / 2;
   const circ = 2 * Math.PI * r;
@@ -415,7 +392,6 @@ const ScoreRing = memo(function ScoreRing({ score, size = 68 }) {
   );
 });
 
-// Beginner-friendly indicator card with plain English tooltip
 const IndicatorCard = memo(function IndicatorCard({ label, value, signal, sub, onClick, plainEnglish }) {
   const s = signal || "HOLD";
   const [showTip, setShowTip] = useState(false);
@@ -431,9 +407,7 @@ const IndicatorCard = memo(function IndicatorCard({ label, value, signal, sub, o
         </div>
         <div style={{ fontSize: 15, fontWeight: 800, fontFamily: "'DM Mono',monospace", color: sigColor(s), marginBottom: 2 }}>{value}</div>
         <div style={{ fontSize: 10, color: "#9ca3af" }}>{sub}</div>
-        <div style={{ fontSize: 9, color: "#6b7280", marginTop: 4, borderTop: "1px dashed #e5e7eb", paddingTop: 4, fontStyle: "italic" }}>
-          Tap for explanation ↗
-        </div>
+        <div style={{ fontSize: 9, color: "#6b7280", marginTop: 4, borderTop: "1px dashed #e5e7eb", paddingTop: 4, fontStyle: "italic" }}>Tap for explanation ↗</div>
       </div>
       {showTip && plainEnglish && (
         <div style={{ position: "absolute", bottom: "calc(100% + 6px)", left: 0, right: 0, background: "#1e293b", color: "#e2e8f0", borderRadius: 10, padding: "10px 12px", fontSize: 11, lineHeight: 1.55, zIndex: 50, boxShadow: "0 8px 24px rgba(0,0,0,0.2)", pointerEvents: "none" }}>
@@ -497,7 +471,6 @@ function InteractiveChart({ history, range, onRangeChange }) {
   );
 }
 
-// Beginner-friendly explainer modal
 function ExplainModal({ indicator, onClose, onAskAI }) {
   if (!indicator) return null;
   const info = EXPLANATIONS[indicator] || { what: "Details coming soon.", howToRead: "", emoji: "📊" };
@@ -512,25 +485,17 @@ function ExplainModal({ indicator, onClose, onAskAI }) {
           </div>
           <button onClick={onClose} style={{ background: "#f3f4f6", border: "none", borderRadius: 8, padding: "6px 14px", cursor: "pointer", fontSize: 13, fontWeight: 700 }}>✕</button>
         </div>
-
-        {/* Plain English - BIG and first */}
         <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 14, padding: "16px 18px", marginBottom: 16 }}>
           <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#d97706", marginBottom: 8 }}>Simple English</div>
           <div style={{ fontSize: 15, color: "#374151", lineHeight: 1.7, fontWeight: 500 }}>{plain}</div>
         </div>
-
-        {/* Technical details - collapsed below */}
-        {[
-          { label: "What is it technically?", content: info.what },
-          { label: "How to read it", content: info.howToRead },
-        ].filter(s => s.content).map(s => (
+        {[{ label: "What is it technically?", content: info.what }, { label: "How to read it", content: info.howToRead }].filter(s => s.content).map(s => (
           <div key={s.label} style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#6b7280", marginBottom: 6 }}>{s.label}</div>
             <div style={{ fontSize: 13, color: "#374151", lineHeight: 1.7, background: "#f9fafb", borderRadius: 10, padding: "12px 14px" }}>{s.content}</div>
           </div>
         ))}
-
-        <button onClick={() => { onAskAI(`Explain ${indicator} in super simple terms. What does it mean for my stock right now? Give me a beginner-friendly explanation with an example.`); onClose(); }}
+        <button onClick={() => { onAskAI(`Explain ${indicator} in super simple terms. What does it mean for my stock right now?`); onClose(); }}
           style={{ width: "100%", background: "#111827", color: "#fff", border: "none", borderRadius: 10, padding: "13px 0", fontSize: 13, fontWeight: 700, cursor: "pointer", marginTop: 8 }}>
           🤖 Ask Sanket AI to explain this for me
         </button>
@@ -539,30 +504,21 @@ function ExplainModal({ indicator, onClose, onAskAI }) {
   );
 }
 
-// Loading spinner for stock data
 function DataLoader({ symbol }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: "#eff6ff", borderRadius: 10, marginBottom: 12, border: "1px solid #bfdbfe" }}>
       <div style={{ width: 16, height: 16, border: "2px solid #bfdbfe", borderTopColor: "#2563eb", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-      <div style={{ fontSize: 12, color: "#1d4ed8", fontWeight: 600 }}>Fetching real NSE data for {symbol} from Twelve Data…</div>
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      <div style={{ fontSize: 12, color: "#1d4ed8", fontWeight: 600 }}>Fetching real NSE data for {symbol} from Yahoo Finance…</div>
     </div>
   );
 }
 
-// AI Chat Panel
 function AIChatPanel({ aiMsgs, aiLoading, aiInput, setAiInput, sendAI, selStock, chatEndRef, aiState, setAiState }) {
   const isOpen = aiState === "open";
-  const quickPrompts = [
-    "What does this score mean?",
-    "Should I buy more?",
-    "What are the risks?",
-    selStock ? `Explain ${selStock.symbol} in simple terms` : "How does RSI work?",
-  ];
+  const quickPrompts = ["What does this score mean?", "Should I buy more?", "What are the risks?", selStock ? `Explain ${selStock.symbol} in simple terms` : "How does RSI work?"];
   if (aiState === "hidden") {
     return (
-      <button onClick={() => setAiState("open")}
-        style={{ position: "fixed", bottom: 24, right: 24, background: "#111827", color: "#fff", border: "none", borderRadius: 16, padding: "12px 20px", fontSize: 13, fontWeight: 700, cursor: "pointer", boxShadow: "0 8px 32px rgba(0,0,0,0.25)", zIndex: 200, display: "flex", alignItems: "center", gap: 8 }}>
+      <button onClick={() => setAiState("open")} style={{ position: "fixed", bottom: 24, right: 24, background: "#111827", color: "#fff", border: "none", borderRadius: 16, padding: "12px 20px", fontSize: 13, fontWeight: 700, cursor: "pointer", boxShadow: "0 8px 32px rgba(0,0,0,0.25)", zIndex: 200, display: "flex", alignItems: "center", gap: 8 }}>
         <span style={{ fontSize: 16 }}>🤖</span> Sanket AI
         {aiMsgs.length > 1 && <span style={{ background: "#2563eb", borderRadius: "50%", width: 18, height: 18, fontSize: 10, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800 }}>{aiMsgs.filter(m => m.role === "assistant").length}</span>}
       </button>
@@ -570,8 +526,7 @@ function AIChatPanel({ aiMsgs, aiLoading, aiInput, setAiInput, sendAI, selStock,
   }
   return (
     <div style={{ position: "fixed", bottom: 0, right: 24, width: 300, background: "#fff", border: "1px solid #e5e7eb", borderRadius: "16px 16px 0 0", boxShadow: "0 -4px 40px rgba(0,0,0,0.12)", zIndex: 200, display: "flex", flexDirection: "column", maxHeight: isOpen ? 480 : 0, transition: "max-height 0.3s cubic-bezier(0.4,0,0.2,1)", overflow: "hidden" }}>
-      <div style={{ padding: "10px 14px", borderBottom: isOpen ? "1px solid #f3f4f6" : "none", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none", background: isOpen ? "#fff" : "#f9fafb", borderRadius: "16px 16px 0 0", flexShrink: 0 }}
-        onClick={() => setAiState(isOpen ? "minimized" : "open")}>
+      <div style={{ padding: "10px 14px", borderBottom: isOpen ? "1px solid #f3f4f6" : "none", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none", background: isOpen ? "#fff" : "#f9fafb", borderRadius: "16px 16px 0 0", flexShrink: 0 }} onClick={() => setAiState(isOpen ? "minimized" : "open")}>
         <div style={{ width: 8, height: 8, borderRadius: "50%", background: aiLoading ? "#f59e0b" : "#16a34a" }} />
         <div style={{ flex: 1 }}>
           <div style={{ fontWeight: 800, fontSize: 13, color: "#111827" }}>Sanket AI</div>
@@ -582,34 +537,26 @@ function AIChatPanel({ aiMsgs, aiLoading, aiInput, setAiInput, sendAI, selStock,
             <button onClick={e => { e.stopPropagation(); setAiState("minimized"); }} style={{ background: "#f3f4f6", border: "none", borderRadius: 6, width: 24, height: 24, cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center", color: "#6b7280" }}>—</button>
             <button onClick={e => { e.stopPropagation(); setAiState("hidden"); }} style={{ background: "#f3f4f6", border: "none", borderRadius: 6, width: 24, height: 24, cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center", color: "#6b7280" }}>✕</button>
           </div>
-        ) : (
-          <div style={{ fontSize: 11, color: "#6b7280", fontWeight: 600 }}>▲ Open</div>
-        )}
+        ) : <div style={{ fontSize: 11, color: "#6b7280", fontWeight: 600 }}>▲ Open</div>}
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
         {aiMsgs.map((m, i) => (
-          <div key={i} style={{ maxWidth: "92%", alignSelf: m.role === "user" ? "flex-end" : "flex-start", background: m.role === "user" ? "#111827" : "#f3f4f6", borderRadius: m.role === "user" ? "14px 14px 3px 14px" : "14px 14px 14px 3px", padding: "9px 12px", fontSize: 12, lineHeight: 1.65, color: m.role === "user" ? "#fff" : "#111827", whiteSpace: "pre-wrap" }}>
-            {m.content}
-          </div>
+          <div key={i} style={{ maxWidth: "92%", alignSelf: m.role === "user" ? "flex-end" : "flex-start", background: m.role === "user" ? "#111827" : "#f3f4f6", borderRadius: m.role === "user" ? "14px 14px 3px 14px" : "14px 14px 14px 3px", padding: "9px 12px", fontSize: 12, lineHeight: 1.65, color: m.role === "user" ? "#fff" : "#111827", whiteSpace: "pre-wrap" }}>{m.content}</div>
         ))}
         {aiLoading && <div style={{ alignSelf: "flex-start", background: "#f3f4f6", borderRadius: "14px 14px 14px 3px", padding: "9px 12px", fontSize: 12, color: "#9ca3af" }}>Thinking…</div>}
         <div ref={chatEndRef} />
       </div>
       <div style={{ padding: "0 10px 6px", display: "flex", flexWrap: "wrap", gap: 4 }}>
-        {quickPrompts.map(p => (
-          <button key={p} onClick={() => { setAiInput(p); }} style={{ background: "#f3f4f6", border: "none", color: "#374151", borderRadius: 7, padding: "4px 8px", fontSize: 10, cursor: "pointer", fontWeight: 600 }}>{p}</button>
-        ))}
+        {quickPrompts.map(p => <button key={p} onClick={() => setAiInput(p)} style={{ background: "#f3f4f6", border: "none", color: "#374151", borderRadius: 7, padding: "4px 8px", fontSize: 10, cursor: "pointer", fontWeight: 600 }}>{p}</button>)}
       </div>
       <div style={{ padding: "6px 10px 10px", borderTop: "1px solid #f3f4f6", display: "flex", gap: 6 }}>
-        <input value={aiInput} onChange={e => setAiInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendAI()} placeholder="Ask anything in plain English…"
-          style={{ flex: 1, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 9, padding: "7px 11px", color: "#111827", fontSize: 12, outline: "none", fontFamily: "'DM Sans',sans-serif" }} />
+        <input value={aiInput} onChange={e => setAiInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendAI()} placeholder="Ask anything in plain English…" style={{ flex: 1, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 9, padding: "7px 11px", color: "#111827", fontSize: 12, outline: "none", fontFamily: "'DM Sans',sans-serif" }} />
         <button onClick={sendAI} style={{ background: "#111827", color: "#fff", border: "none", borderRadius: 8, padding: "0 12px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>↑</button>
       </div>
     </div>
   );
 }
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
 export default function Sanket() {
   const [portfolio, setPortfolio] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -642,24 +589,18 @@ export default function Sanket() {
   const totalPct = totalInvested > 0 ? totalPnL / totalInvested * 100 : 0;
   const suggestions = POPULAR.filter(s => s.includes(searchQ.toUpperCase()) && searchQ.length > 0).slice(0, 6);
 
-  // Auto-analysis when stock selected
   useEffect(() => {
     if (!selStock || !selInd || autoAnalysisDone[selStock.id]) return;
     const signal = sig(selInd.score);
     const { buyReasons, avoidReasons } = getBuySellReasons(selInd, selStock);
     const buyList = buyReasons.map(r => `+ ${r.text}`).join("\n");
     const avoidList = avoidReasons.map(r => `- ${r.text}`).join("\n");
-    const dataSource = selStock.realData ? "✅ Real-time data from Yahoo Finance" : "⚠️ Simulated data (couldn't fetch real data)";
-    const prompt = `Auto-analyse ${selStock.symbol}. ${dataSource}. Sanket Score: ${selInd.score}/10 (${signal}). P&L: ${((selStock.currentPrice - selStock.buyPrice) / selStock.buyPrice * 100).toFixed(1)}%.
-
-Buy signals:\n${buyList}\n\nRisk signals:\n${avoidList}
-
-Give a beginner-friendly analysis in plain English. Use simple language — imagine explaining to someone who just started investing. Include: 1) What this score means in plain terms, 2) Why it could go up, 3) Why it could fall, 4) A clear action. Max 180 words. No jargon unless you explain it.`;
+    const dataSource = selStock.realData ? "✅ Real data from Yahoo Finance" : "⚠️ Simulated data";
+    const prompt = `Auto-analyse ${selStock.symbol}. ${dataSource}. Sanket Score: ${selInd.score}/10 (${signal}). P&L: ${((selStock.currentPrice - selStock.buyPrice) / selStock.buyPrice * 100).toFixed(1)}%.\n\nBuy signals:\n${buyList}\n\nRisk signals:\n${avoidList}\n\nGive a beginner-friendly analysis in plain English. Include: 1) What this score means, 2) Why it could go up, 3) Why it could fall, 4) A clear action. Max 180 words. No jargon.`;
     triggerAI(prompt, true);
     setAutoAnalysisDone(prev => ({ ...prev, [selStock.id]: true }));
   }, [selStock?.id]);
 
-  // Live price refresh every 60s during market hours
   useEffect(() => {
     if (portfolio.length === 0) return;
     const refresh = async () => {
@@ -677,6 +618,7 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
     const interval = setInterval(refresh, 60000);
     return () => clearInterval(interval);
   }, [portfolio.length]);
+
   useEffect(() => {
     if (portfolio.length === 0) return;
     const newAlerts = [];
@@ -706,21 +648,15 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-20250514", max_tokens: 1000,
-          system: `You are Sanket AI — a friendly Indian stock market guide for beginners and Gen Z investors. Your job is to make investing simple, not scary. ALWAYS use plain English. Avoid jargon, or if you use it, explain it immediately in brackets. Use analogies and real-life comparisons. Be honest and balanced — mention both upsides AND risks. Never be one-sided. Think of yourself as a knowledgeable older sibling explaining stocks over chai, not a stiff financial advisor. Understand the Sanket Score (0–10 composite technical score: trend 40% + momentum 35% + volume 25%). Max 200 words.\n\nPortfolio:\n${ctx || "No stocks yet."}`,
+          system: `You are Sanket AI — a friendly Indian stock market guide for beginners and Gen Z investors. Make investing simple, not scary. ALWAYS use plain English. Avoid jargon or explain it in brackets. Use analogies. Be honest and balanced — mention both upsides AND risks. Think of yourself as a knowledgeable older sibling explaining stocks over chai. Understand the Sanket Score (0–10 composite: trend 40% + momentum 35% + volume 25%). Max 200 words.\n\nPortfolio:\n${ctx || "No stocks yet."}`,
           messages: [...aiMsgs.filter(m => !m.content.includes("Analysing ")), { role: "user", content: message }].map(m => ({ role: m.role, content: m.content }))
         })
       });
       const data = await res.json();
       const reply = data.content?.[0]?.text || "Error — please try again.";
-      setAiMsgs(m => {
-        const filtered = isAuto ? m.filter(msg => !msg.content.includes("Analysing ")) : m;
-        return [...filtered, { role: "assistant", content: reply }];
-      });
+      setAiMsgs(m => { const filtered = isAuto ? m.filter(msg => !msg.content.includes("Analysing ")) : m; return [...filtered, { role: "assistant", content: reply }]; });
     } catch {
-      setAiMsgs(m => {
-        const filtered = isAuto ? m.filter(msg => !msg.content.includes("Analysing ")) : m;
-        return [...filtered, { role: "assistant", content: "Connection error. Make sure you're connected to the internet." }];
-      });
+      setAiMsgs(m => { const filtered = isAuto ? m.filter(msg => !msg.content.includes("Analysing ")) : m; return [...filtered, { role: "assistant", content: "Connection error. Make sure you're connected to the internet." }]; });
     }
     setAiLoading(false);
   }
@@ -738,39 +674,18 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
     if (!form.buyPrice || isNaN(form.buyPrice) || +form.buyPrice <= 0) return setAddError("Enter a valid buy price");
     if (!form.qty || isNaN(form.qty) || +form.qty <= 0) return setAddError("Enter a valid quantity");
     if (portfolio.find(s => s.symbol === sym)) return setAddError(`${sym} already in portfolio`);
-
     const buyPrice = parseFloat(form.buyPrice);
     const id = Date.now();
     setLoadingStocks(l => ({ ...l, [id]: true }));
-
-    // Add with buy price first, fetch real data
     const baseHistory = generateHistory(buyPrice);
-    const tempStock = {
-      id, symbol: sym, buyPrice, currentPrice: buyPrice,
-      qty: parseInt(form.qty), thesis: form.thesis,
-      history: baseHistory, addedOn: new Date().toLocaleDateString("en-IN"),
-      realData: false, loading: true
-    };
+    const tempStock = { id, symbol: sym, buyPrice, currentPrice: buyPrice, qty: parseInt(form.qty), thesis: form.thesis, history: baseHistory, addedOn: new Date().toLocaleDateString("en-IN"), realData: false, loading: true };
     setPortfolio(p => [...p, tempStock]);
     setForm({ symbol: "", buyPrice: "", qty: "", thesis: "" });
-    setSearchQ(""); setShowAdd(false);
-    setSelectedId(id);
-
-    // Fetch real data in background
+    setSearchQ(""); setShowAdd(false); setSelectedId(id);
     try {
-      const [quote, history] = await Promise.all([
-        fetchTDQuote(sym),
-        fetchTDHistory(sym)
-      ]);
+      const [quote, history] = await Promise.all([fetchYahooQuote(sym), fetchYahooHistory(sym)]);
       if (quote && history && history.length > 10) {
-        setPortfolio(p => p.map(s => s.id === id ? {
-          ...s,
-          currentPrice: quote.price,
-          history,
-          realData: true,
-          loading: false,
-          quote,
-        } : s));
+        setPortfolio(p => p.map(s => s.id === id ? { ...s, currentPrice: quote.price, history, realData: true, loading: false, quote } : s));
         setAutoAnalysisDone(prev => { const next = {...prev}; delete next[id]; return next; });
       } else if (quote) {
         setPortfolio(p => p.map(s => s.id === id ? { ...s, currentPrice: quote.price, loading: false, realData: false, quote } : s));
@@ -815,7 +730,7 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
       <style>{`@keyframes spin { to { transform: rotate(360deg); } } @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }`}</style>
 
       <header style={C.header}>
-        <div style={C.logo}>san<span style={{ color: "#2563eb" }}>ket</span> <span style={{ fontSize: 11, fontFamily: "DM Sans", fontWeight: 600, color: "#9ca3af" }}>v6 · real data</span></div>
+        <div style={C.logo}>san<span style={{ color: "#2563eb" }}>ket</span> <span style={{ fontSize: 11, fontFamily: "DM Sans", fontWeight: 600, color: "#9ca3af" }}>v6 · yahoo finance</span></div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 5, background: isMarketOpen() ? "#f0fdf4" : "#f9fafb", border: `1px solid ${isMarketOpen() ? "#bbf7d0" : "#e5e7eb"}`, borderRadius: 8, padding: "4px 10px" }}>
             <div style={{ width: 7, height: 7, borderRadius: "50%", background: isMarketOpen() ? "#16a34a" : "#9ca3af" }} />
@@ -831,7 +746,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
       </header>
 
       <div style={C.body}>
-        {/* Sidebar */}
         <div style={C.sidebar}>
           <div style={{ padding: "14px 14px 0" }}>
             <div style={{ background: "#f9fafb", borderRadius: 12, padding: "13px 14px", marginBottom: 12 }}>
@@ -853,7 +767,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
             </div>
             <div style={{ fontSize: 9, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#9ca3af", marginBottom: 8 }}>Holdings</div>
           </div>
-
           {portfolio.length === 0 ? (
             <div style={{ padding: 24, textAlign: "center", color: "#9ca3af" }}>
               <div style={{ fontWeight: 700, color: "#374151", fontSize: 14, marginBottom: 4 }}>No stocks yet</div>
@@ -884,7 +797,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
               </div>
             );
           })}
-
           {alerts.length > 0 && (
             <div style={{ padding: 14, borderTop: "1px solid #f3f4f6", marginTop: "auto" }}>
               <div style={{ fontSize: 9, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#9ca3af", marginBottom: 8 }}>Alerts</div>
@@ -898,7 +810,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
           )}
         </div>
 
-        {/* Main */}
         <div style={C.main}>
           <div style={{ display: "flex", gap: 2, background: "#e5e7eb", borderRadius: 12, padding: 3, marginBottom: 20, width: "fit-content" }}>
             {mainTabs.map(t => (
@@ -907,12 +818,11 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
             ))}
           </div>
 
-          {/* INSIGHTS */}
           {activeTab === "insights" && (
             <div style={{ paddingBottom: 20 }}>
               {portfolio.length === 0 ? (
                 <div style={{ textAlign: "center", color: "#9ca3af", padding: 40 }}>
-                  <div style={{ fontWeight: 700, color: "#374151", fontSize: 16, marginBottom: 4 }}>Add stocks to see portfolio insights</div>
+                  <div style={{ fontWeight: 700, color: "#374151", fontSize: 16 }}>Add stocks to see portfolio insights</div>
                 </div>
               ) : (() => {
                 const allInd = portfolio.map(s => ({ stock: s, ind: calcSanketScore(s.history) }));
@@ -929,7 +839,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                 const portfolioRisk = allInd.filter(x => x.ind.rsi > 65 || sig(x.ind.score) === "SELL").length > portfolio.length / 2 ? "HIGH" : allInd.filter(x => sig(x.ind.score) === "BUY").length > portfolio.length / 2 ? "LOW" : "MEDIUM";
                 return (
                   <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                    {/* Signal summary */}
                     <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, padding: 18 }}>
                       <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#374151", marginBottom: 14 }}>Signal Summary</div>
                       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
@@ -941,16 +850,14 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                         ))}
                       </div>
                     </div>
-
-                    {/* Key insights */}
                     <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, padding: 18 }}>
                       <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#374151", marginBottom: 14 }}>Key Insights</div>
                       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                         {[
                           { icon: "🏦", label: "Top sector concentration", value: topSector ? `${topSectorPct}% in ${topSector[0]}` : "—", warning: topSectorPct > 40, desc: topSectorPct > 40 ? "You're heavily concentrated — consider diversifying" : "Sector allocation looks balanced" },
-                          { icon: "⚠️", label: "Portfolio risk level", value: portfolioRisk, warning: portfolioRisk === "HIGH", desc: portfolioRisk === "HIGH" ? "More than half your stocks show sell/caution signals" : portfolioRisk === "LOW" ? "Most stocks show bullish signals — good position" : "Mixed signals across your portfolio" },
+                          { icon: "⚠️", label: "Portfolio risk level", value: portfolioRisk, warning: portfolioRisk === "HIGH", desc: portfolioRisk === "HIGH" ? "More than half your stocks show sell/caution signals" : portfolioRisk === "LOW" ? "Most stocks show bullish signals" : "Mixed signals across your portfolio" },
                           { icon: "📊", label: "Average RSI", value: avgRSI, warning: avgRSI > 68, desc: avgRSI > 68 ? "Portfolio is overbought — consider taking some profits" : avgRSI < 35 ? "Portfolio is oversold — could be a buying opportunity" : "RSI is in healthy range" },
-                          { icon: "💪", label: "Strongest stock", value: strongest?.stock.symbol, warning: false, desc: `Sanket Score ${strongest?.ind.score}/10 — your best performing signal` },
+                          { icon: "💪", label: "Strongest stock", value: strongest?.stock.symbol, warning: false, desc: `Sanket Score ${strongest?.ind.score}/10` },
                           { icon: "📉", label: "Weakest stock", value: weakest?.stock.symbol, warning: true, desc: `Sanket Score ${weakest?.ind.score}/10 — review if you should exit` },
                         ].map((ins, i) => (
                           <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "12px 14px", background: ins.warning ? "#fef9ec" : "#f9fafb", borderRadius: 10, border: `1px solid ${ins.warning ? "#fde68a" : "#e5e7eb"}` }}>
@@ -964,35 +871,10 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                         ))}
                       </div>
                     </div>
-
-                    {/* Smart alerts */}
-                    {alerts.length > 0 && (
-                      <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, padding: 18 }}>
-                        <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#374151", marginBottom: 14 }}>Active Alerts</div>
-                        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                          {alerts.map(a => (
-                            <div key={a.id} style={{ background: sigBg(a.signal), border: `1px solid ${sigBorder(a.signal)}`, borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
-                              <div style={{ flex: 1 }}>
-                                <div style={{ fontWeight: 800, color: sigColor(a.signal), fontSize: 13 }}>{a.stock} — {a.signal}</div>
-                                <div style={{ color: "#6b7280", fontSize: 11, marginTop: 2 }}>{a.msg}</div>
-                              </div>
-                              <button onClick={() => { setSelectedId(portfolio.find(s => s.symbol === a.stock)?.id); setActiveTab("analysis"); }} style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 7, padding: "4px 10px", fontSize: 11, cursor: "pointer", fontWeight: 700, color: "#374151", whiteSpace: "nowrap" }}>View</button>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* AI mentor prompts */}
                     <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 14, padding: 18 }}>
                       <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#1d4ed8", marginBottom: 12 }}>Ask Sanket AI about your portfolio</div>
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                        {[
-                          `What should I do with ₹10,000 right now given my portfolio?`,
-                          `Am I overinvested in ${topSector?.[0] || "any sector"}?`,
-                          `Which stock is the weakest in my portfolio and should I sell it?`,
-                          `Give me an honest review of my overall portfolio — what am I doing right and wrong?`,
-                        ].map(p => (
+                        {[`What should I do with ₹10,000 right now given my portfolio?`, `Am I overinvested in ${topSector?.[0] || "any sector"}?`, `Which stock is the weakest and should I sell it?`, `Give me an honest review of my overall portfolio.`].map(p => (
                           <button key={p} onClick={() => { triggerAI(p, false); setAiState("open"); }} style={{ background: "#fff", border: "1px solid #bfdbfe", borderRadius: 9, padding: "10px 14px", fontSize: 12, cursor: "pointer", fontWeight: 600, color: "#1d4ed8", textAlign: "left" }}>{p}</button>
                         ))}
                       </div>
@@ -1003,7 +885,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
             </div>
           )}
 
-          {/* SECTORS */}
           {activeTab === "sectors" && (
             <div style={{ padding: "0 0 20px" }}>
               {portfolio.length === 0 ? (
@@ -1013,13 +894,7 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {Object.entries(
-                    portfolio.reduce((map, s) => {
-                      const sec = SECTOR_MAP[s.symbol] || "Other";
-                      if (!map[sec]) map[sec] = [];
-                      map[sec].push(s); return map;
-                    }, {})
-                  ).map(([sector, stocks]) => {
+                  {Object.entries(portfolio.reduce((map, s) => { const sec = SECTOR_MAP[s.symbol] || "Other"; if (!map[sec]) map[sec] = []; map[sec].push(s); return map; }, {})).map(([sector, stocks]) => {
                     const avgSc = parseFloat((stocks.reduce((a, s) => a + calcSanketScore(s.history).score, 0) / stocks.length).toFixed(1));
                     const signal = sig(avgSc);
                     const color = SECTOR_COLORS[sector] || "#6b7280";
@@ -1033,12 +908,7 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                         <div style={{ fontSize: 12, color: "#6b7280" }}>{stocks.length} stock{stocks.length !== 1 ? "s" : ""} · Avg Score: <b style={{ color: sigColor(signal) }}>{avgSc}/10</b></div>
                         {stocks.map(s => {
                           const pnl = ((s.currentPrice - s.buyPrice) / s.buyPrice * 100).toFixed(1);
-                          return (
-                            <div key={s.id} onClick={() => { setSelectedId(s.id); setActiveTab("analysis"); }} style={{ marginTop: 8, padding: "8px 12px", background: "#f9fafb", borderRadius: 10, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                              <span style={{ fontWeight: 700, fontFamily: "'DM Mono',monospace", fontSize: 13 }}>{s.symbol}</span>
-                              <span style={{ fontSize: 12, fontWeight: 700, color: parseFloat(pnl) >= 0 ? "#16a34a" : "#dc2626" }}>{pnl >= 0 ? "+" : ""}{pnl}%</span>
-                            </div>
-                          );
+                          return <div key={s.id} onClick={() => { setSelectedId(s.id); setActiveTab("analysis"); }} style={{ marginTop: 8, padding: "8px 12px", background: "#f9fafb", borderRadius: 10, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}><span style={{ fontWeight: 700, fontFamily: "'DM Mono',monospace", fontSize: 13 }}>{s.symbol}</span><span style={{ fontSize: 12, fontWeight: 700, color: parseFloat(pnl) >= 0 ? "#16a34a" : "#dc2626" }}>{pnl >= 0 ? "+" : ""}{pnl}%</span></div>;
                         })}
                       </div>
                     );
@@ -1048,7 +918,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
             </div>
           )}
 
-          {/* RESEARCH */}
           {activeTab === "research" && selStock && (
             <div>
               <button onClick={() => setActiveTab("analysis")} style={{ background: "none", border: "none", color: "#6b7280", fontSize: 13, fontWeight: 700, cursor: "pointer", marginBottom: 16 }}>← Back to Analysis</button>
@@ -1085,32 +954,26 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
             </div>
           )}
 
-          {/* ANALYSIS */}
           {activeTab === "analysis" && (
             <>
               {!selStock ? (
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "60vh", color: "#9ca3af", textAlign: "center" }}>
                   <div style={{ fontSize: 52, marginBottom: 16, opacity: 0.15 }}>◎</div>
                   <div style={{ fontWeight: 700, color: "#374151", fontSize: 18, marginBottom: 8 }}>Select a stock</div>
-                  <div style={{ fontSize: 14, maxWidth: 340, lineHeight: 1.6, color: "#6b7280" }}>Click any holding on the left. I'll explain everything in plain English — no confusing charts or jargon.</div>
+                  <div style={{ fontSize: 14, maxWidth: 340, lineHeight: 1.6, color: "#6b7280" }}>Click any holding on the left. I'll explain everything in plain English.</div>
                   {portfolio.length === 0 && <button style={{ marginTop: 20, background: "#111827", color: "#fff", border: "none", borderRadius: 10, padding: "12px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer" }} onClick={() => setShowAdd(true)}>Add your first stock →</button>}
                 </div>
               ) : (
                 <>
-                  {/* Stock Header */}
                   <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 16 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
                       <ScoreRing score={selInd.score} size={70} />
                       <div>
                         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                           <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 22, fontWeight: 800 }}>{selStock.symbol}</div>
-                          {selStock.realData ? (
-                            <span style={{ fontSize: 10, background: "#f0fdf4", color: "#16a34a", border: "1px solid #bbf7d0", borderRadius: 5, padding: "2px 7px", fontWeight: 700 }}>✅ LIVE DATA</span>
-                          ) : selStock.loading ? (
-                            <span style={{ fontSize: 10, background: "#eff6ff", color: "#2563eb", border: "1px solid #bfdbfe", borderRadius: 5, padding: "2px 7px", fontWeight: 700 }}>⏳ Loading…</span>
-                          ) : (
-                            <span style={{ fontSize: 10, background: "#fffbeb", color: "#d97706", border: "1px solid #fde68a", borderRadius: 5, padding: "2px 7px", fontWeight: 700 }}>⚠️ Simulated</span>
-                          )}
+                          {selStock.realData ? <span style={{ fontSize: 10, background: "#f0fdf4", color: "#16a34a", border: "1px solid #bbf7d0", borderRadius: 5, padding: "2px 7px", fontWeight: 700 }}>✅ LIVE DATA</span>
+                          : selStock.loading ? <span style={{ fontSize: 10, background: "#eff6ff", color: "#2563eb", border: "1px solid #bfdbfe", borderRadius: 5, padding: "2px 7px", fontWeight: 700 }}>⏳ Loading…</span>
+                          : <span style={{ fontSize: 10, background: "#fffbeb", color: "#d97706", border: "1px solid #fde68a", borderRadius: 5, padding: "2px 7px", fontWeight: 700 }}>⚠️ Simulated</span>}
                         </div>
                         <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 4 }}>{SECTOR_MAP[selStock.symbol] || "Equity"} · Added {selStock.addedOn}</div>
                         <span style={{ fontSize: 12, fontWeight: 800, padding: "4px 10px", borderRadius: 6, background: sigBg(sig(selInd.score)), color: sigColor(sig(selInd.score)) }}>Sanket Score {selInd.score}/10 — {sig(selInd.score)}</span>
@@ -1130,11 +993,8 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                   </div>
 
                   {selStock.loading && <DataLoader symbol={selStock.symbol} />}
-
-                  {/* Chart */}
                   <InteractiveChart history={selStock.history} range={range} onRangeChange={setRange} />
 
-                  {/* P&L Quick Stats */}
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 18 }}>
                     {[
                       { l: "P&L", v: `${((selStock.currentPrice - selStock.buyPrice) * selStock.qty >= 0) ? "+" : ""}₹${Math.abs((selStock.currentPrice - selStock.buyPrice) * selStock.qty).toFixed(0)}`, c: (selStock.currentPrice - selStock.buyPrice) >= 0 ? "#16a34a" : "#dc2626", hint: "Your profit or loss" },
@@ -1150,7 +1010,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                     ))}
                   </div>
 
-                  {/* Decision Intelligence */}
                   {(() => {
                     const { buyReasons, avoidReasons } = getBuySellReasons(selInd, selStock);
                     return (
@@ -1158,29 +1017,15 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                         <div style={C.sectionTitle}>Decision Intelligence</div>
                         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                           <div style={{ background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 14, padding: 16 }}>
-                            <div style={{ fontSize: 11, fontWeight: 800, color: "#16a34a", letterSpacing: 0.5, marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
-                              <span style={{ fontSize: 16 }}>✅</span> Why to Buy
-                            </div>
-                            {buyReasons.length > 0 ? buyReasons.map((r, i) => (
-                              <div key={i} style={{ display: "flex", gap: 8, marginBottom: 10, alignItems: "flex-start" }}>
-                                <span style={{ fontSize: 14, flexShrink: 0 }}>{r.icon}</span>
-                                <span style={{ fontSize: 12, color: "#374151", lineHeight: 1.5 }}>{r.text}</span>
-                              </div>
-                            )) : <div style={{ fontSize: 12, color: "#9ca3af", fontStyle: "italic" }}>No strong buy signals right now.</div>}
+                            <div style={{ fontSize: 11, fontWeight: 800, color: "#16a34a", letterSpacing: 0.5, marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}><span style={{ fontSize: 16 }}>✅</span> Why to Buy</div>
+                            {buyReasons.length > 0 ? buyReasons.map((r, i) => <div key={i} style={{ display: "flex", gap: 8, marginBottom: 10, alignItems: "flex-start" }}><span style={{ fontSize: 14, flexShrink: 0 }}>{r.icon}</span><span style={{ fontSize: 12, color: "#374151", lineHeight: 1.5 }}>{r.text}</span></div>) : <div style={{ fontSize: 12, color: "#9ca3af", fontStyle: "italic" }}>No strong buy signals right now.</div>}
                           </div>
                           <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 14, padding: 16 }}>
-                            <div style={{ fontSize: 11, fontWeight: 800, color: "#dc2626", letterSpacing: 0.5, marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
-                              <span style={{ fontSize: 16 }}>⚠️</span> Why to Avoid / Sell
-                            </div>
-                            {avoidReasons.length > 0 ? avoidReasons.map((r, i) => (
-                              <div key={i} style={{ display: "flex", gap: 8, marginBottom: 10, alignItems: "flex-start" }}>
-                                <span style={{ fontSize: 14, flexShrink: 0 }}>{r.icon}</span>
-                                <span style={{ fontSize: 12, color: "#374151", lineHeight: 1.5 }}>{r.text}</span>
-                              </div>
-                            )) : <div style={{ fontSize: 12, color: "#9ca3af", fontStyle: "italic" }}>No major red flags detected.</div>}
+                            <div style={{ fontSize: 11, fontWeight: 800, color: "#dc2626", letterSpacing: 0.5, marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}><span style={{ fontSize: 16 }}>⚠️</span> Why to Avoid / Sell</div>
+                            {avoidReasons.length > 0 ? avoidReasons.map((r, i) => <div key={i} style={{ display: "flex", gap: 8, marginBottom: 10, alignItems: "flex-start" }}><span style={{ fontSize: 14, flexShrink: 0 }}>{r.icon}</span><span style={{ fontSize: 12, color: "#374151", lineHeight: 1.5 }}>{r.text}</span></div>) : <div style={{ fontSize: 12, color: "#9ca3af", fontStyle: "italic" }}>No major red flags detected.</div>}
                           </div>
                         </div>
-                        <button onClick={() => { triggerAI(`Give me a deep balanced analysis of ${selStock.symbol} for a beginner investor. Sanket Score is ${selInd.score}/10. Explain in simple terms why it could go up AND why it could fall. Use simple language, no jargon.`); setAiState("open"); }}
+                        <button onClick={() => { triggerAI(`Give me a deep balanced analysis of ${selStock.symbol} for a beginner investor. Sanket Score is ${selInd.score}/10. Explain in simple terms why it could go up AND why it could fall.`); setAiState("open"); }}
                           style={{ width: "100%", marginTop: 10, background: "#111827", color: "#fff", border: "none", borderRadius: 10, padding: "11px 0", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
                           🤖 Ask AI for a deeper plain-English analysis →
                         </button>
@@ -1188,7 +1033,6 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                     );
                   })()}
 
-                  {/* Sanket Score Breakdown */}
                   <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 12, padding: "14px 16px", marginBottom: 18 }}>
                     <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: 1, textTransform: "uppercase", color: "#1d4ed8", marginBottom: 6 }}>Sanket Score Breakdown</div>
                     <div style={{ fontSize: 11, color: "#3b82f6", marginBottom: 12 }}>A composite of 13 technical signals. Higher = stronger bullish case.</div>
@@ -1199,10 +1043,7 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                     ].map(b => (
                       <div key={b.label} style={{ marginBottom: 12 }}>
                         <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 2 }}>
-                          <div>
-                            <span style={{ color: "#374151", fontWeight: 700 }}>{b.label}</span>
-                            <span style={{ color: "#6b7280", fontSize: 10, marginLeft: 6 }}>{b.what}</span>
-                          </div>
+                          <div><span style={{ color: "#374151", fontWeight: 700 }}>{b.label}</span><span style={{ color: "#6b7280", fontSize: 10, marginLeft: 6 }}>{b.what}</span></div>
                           <span style={{ fontWeight: 800, fontFamily: "'DM Mono',monospace", color: sigColor(sig(b.score)) }}>{b.score}/10</span>
                         </div>
                         <div style={{ height: 6, background: "#dbeafe", borderRadius: 3 }}>
@@ -1212,21 +1053,15 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                     ))}
                   </div>
 
-                  {/* Indicators — Scrollable section */}
                   <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 14, overflow: "hidden", marginBottom: 18 }}>
                     <div style={{ padding: "14px 16px", borderBottom: "1px solid #f3f4f6", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                       <div style={{ fontSize: 12, fontWeight: 800, color: "#374151" }}>All Technical Indicators</div>
                       <div style={{ fontSize: 10, color: "#9ca3af" }}>Hover for plain English · Tap for full explanation</div>
                     </div>
-
-                    {/* Scrollable content */}
                     <div style={{ overflowY: "auto", maxHeight: 500, padding: "14px 16px" }}>
-
-                      {/* Trend */}
                       <div style={{ marginBottom: 18 }}>
                         <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: 1.2, textTransform: "uppercase", color: "#374151", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
-                          🌊 Trend Indicators
-                          <span style={{ fontSize: 10, color: "#9ca3af", fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>— Is the stock going up or down overall?</span>
+                          🌊 Trend Indicators <span style={{ fontSize: 10, color: "#9ca3af", fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>— Is the stock going up or down overall?</span>
                         </div>
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
                           <IndicatorCard label="Supertrend" value={selInd.st.signal} signal={selInd.st.signal} sub={`ATR ${selInd.st.atr}`} onClick={() => setExplainInd("Supertrend")} plainEnglish={PLAIN_ENGLISH["Supertrend"]} />
@@ -1237,12 +1072,9 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                           <IndicatorCard label="ATR (14)" value={`₹${selInd.atr}`} signal="HOLD" sub="Daily volatility" onClick={() => setExplainInd("ATR")} plainEnglish={PLAIN_ENGLISH["ATR"]} />
                         </div>
                       </div>
-
-                      {/* Momentum */}
                       <div style={{ marginBottom: 18 }}>
                         <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: 1.2, textTransform: "uppercase", color: "#374151", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
-                          ⚡ Momentum Indicators
-                          <span style={{ fontSize: 10, color: "#9ca3af", fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>— Is buying/selling pressure speeding up?</span>
+                          ⚡ Momentum Indicators <span style={{ fontSize: 10, color: "#9ca3af", fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>— Is buying/selling pressure speeding up?</span>
                         </div>
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
                           <IndicatorCard label="RSI (14)" value={selInd.rsi} signal={selInd.rsi < 30 ? "BUY" : selInd.rsi > 70 ? "SELL" : "HOLD"} sub={selInd.rsi < 30 ? "Oversold" : selInd.rsi > 70 ? "Overbought" : "Neutral"} onClick={() => setExplainInd("RSI")} plainEnglish={PLAIN_ENGLISH["RSI"]} />
@@ -1252,12 +1084,9 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
                           <IndicatorCard label="CCI (20)" value={selInd.cci.cci} signal={selInd.cci.signal} sub={selInd.cci.cci < -100 ? "Oversold" : selInd.cci.cci > 100 ? "Overbought" : "Neutral"} onClick={() => setExplainInd("CCI")} plainEnglish={PLAIN_ENGLISH["CCI"]} />
                         </div>
                       </div>
-
-                      {/* Volume */}
                       <div style={{ marginBottom: 4 }}>
                         <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: 1.2, textTransform: "uppercase", color: "#374151", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
-                          📦 Volume Indicators
-                          <span style={{ fontSize: 10, color: "#9ca3af", fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>— Are big players buying or quietly selling?</span>
+                          📦 Volume Indicators <span style={{ fontSize: 10, color: "#9ca3af", fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>— Are big players buying or quietly selling?</span>
                         </div>
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
                           <IndicatorCard label="OBV Trend" value={selInd.obv.trend} signal={selInd.obv.trend === "Rising" ? "BUY" : "SELL"} sub="On-Balance Volume" onClick={() => setExplainInd("OBV")} plainEnglish={PLAIN_ENGLISH["OBV"]} />
@@ -1282,12 +1111,11 @@ Give a beginner-friendly analysis in plain English. Use simple language — imag
 
       <AIChatPanel aiMsgs={aiMsgs} aiLoading={aiLoading} aiInput={aiInput} setAiInput={setAiInput} sendAI={sendAI} selStock={selStock} chatEndRef={chatEndRef} aiState={aiState} setAiState={setAiState} />
 
-      {/* Add Stock Modal */}
       {showAdd && (
         <div style={C.modal} onClick={e => e.target === e.currentTarget && setShowAdd(false)}>
           <div style={{ background: "#fff", borderRadius: 20, padding: 28, width: 480, maxWidth: "95vw", boxShadow: "0 20px 60px rgba(0,0,0,0.15)" }}>
             <div style={{ fontFamily: "'DM Mono',monospace", fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Add Stock</div>
-            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 20 }}>We'll fetch real data from Yahoo Finance automatically 🔄</div>
+            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 20 }}>Real data from Yahoo Finance — free, no key needed 🎉</div>
             <div style={{ marginBottom: 14, position: "relative" }}>
               <label style={C.label}>NSE Stock Symbol</label>
               <input style={C.input} value={searchQ} onChange={e => { setSearchQ(e.target.value); setForm(f => ({ ...f, symbol: e.target.value })); }} placeholder="Type e.g. ZOMATO, TATASTEEL, RELIANCE…" />
