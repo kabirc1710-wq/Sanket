@@ -1,11 +1,7 @@
-// /api/market.js — Secure Twelve Data proxy (Vercel serverless function)
-// Your API key lives ONLY here, server-side. Users can never see it.
-
 const TD_BASE = "https://api.twelvedata.com";
 
-// Simple in-memory cache to avoid hammering the API (resets on cold start)
 const cache = {};
-const CACHE_TTL = 60 * 1000; // 60 seconds
+const CACHE_TTL = 60 * 1000;
 
 function cached(key, data) {
   cache[key] = { data, ts: Date.now() };
@@ -35,7 +31,7 @@ export default async function handler(req, res) {
       const cacheKey = `price:${symbol}`;
       const hit = getCached(cacheKey);
       if (hit) return res.status(200).json(hit);
-      const r = await fetch(`${TD_BASE}/price?symbol=${symbol}:NSE&apikey=${apiKey}`);
+      const r = await fetch(`${TD_BASE}/price?symbol=${symbol}&exchange=NSE&apikey=${apiKey}`);
       const data = await r.json();
       if (data.status === "error") return res.status(400).json({ error: data.message });
       cached(cacheKey, data);
@@ -46,8 +42,8 @@ export default async function handler(req, res) {
       const cacheKey = `prices:${symbols}`;
       const hit = getCached(cacheKey);
       if (hit) return res.status(200).json(hit);
-      const nseSymbols = symbols.split(",").map(s => `${s.trim()}:NSE`).join(",");
-      const r = await fetch(`${TD_BASE}/price?symbol=${nseSymbols}&apikey=${apiKey}`);
+      const symbolList = symbols.split(",").map(s => s.trim()).join(",");
+      const r = await fetch(`${TD_BASE}/price?symbol=${symbolList}&exchange=NSE&apikey=${apiKey}`);
       const data = await r.json();
       if (data.status === "error") return res.status(400).json({ error: data.message });
       cached(cacheKey, data);
@@ -58,7 +54,7 @@ export default async function handler(req, res) {
       const cacheKey = `quote:${symbol}`;
       const hit = getCached(cacheKey);
       if (hit) return res.status(200).json(hit);
-      const r = await fetch(`${TD_BASE}/quote?symbol=${symbol}:NSE&apikey=${apiKey}`);
+      const r = await fetch(`${TD_BASE}/quote?symbol=${symbol}&exchange=NSE&apikey=${apiKey}`);
       const data = await r.json();
       if (data.status === "error") return res.status(400).json({ error: data.message });
       cached(cacheKey, data);
@@ -71,7 +67,7 @@ export default async function handler(req, res) {
       if (histEntry && Date.now() - histEntry.ts < 5 * 60 * 1000) {
         return res.status(200).json(histEntry.data);
       }
-      const r = await fetch(`${TD_BASE}/time_series?symbol=${symbol}:NSE&interval=1day&outputsize=365&apikey=${apiKey}`);
+      const r = await fetch(`${TD_BASE}/time_series?symbol=${symbol}&exchange=NSE&interval=1day&outputsize=365&apikey=${apiKey}`);
       const data = await r.json();
       if (data.status === "error") return res.status(400).json({ error: data.message });
       cache[cacheKey] = { data, ts: Date.now() };
